@@ -1,0 +1,3 @@
+entero principal() {
+    retornar 0
+}

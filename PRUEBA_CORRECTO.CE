@@ -1,0 +1,13 @@
+entero principal() {
+    entero cantidad = 3;
+    decimal precio = 25.50;
+    decimal total = cantidad * precio;
+    constante decimal minimo = 50.0;
+
+    si (total >= minimo) {
+        total = total - 5.0;
+    }
+
+    mostrar("Articulos: ", cantidad, ", total: $", total);
+    retornar 0;
+}

@@ -1,0 +1,4 @@
+entero principal() {
+    mostrar("Total: ", total);
+    retornar 0;
+}

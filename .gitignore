@@ -1,0 +1,14 @@
+# Entornos virtuales y caché de Python
+/.venv/
+/venv/
+__pycache__/
+*.py[cod]
+
+# Instrucciones locales de OpenCode
+/AGENTS.md
+
+# Archivos generados al ejecutar el compilador en la raíz
+/ANALISIS_OUTPUT.TXT
+/ARBOL_SINTACTICO.PNG
+/REPORTE_ANALISIS.TXT
+/SYMBOLS.TXT
