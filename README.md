@@ -4,6 +4,16 @@ Proyecto de Lenguajes y Autómatas II. CE es un lenguaje inspirado en C con pala
 
 El analizador léxico recorre [`MATRIZ_TRANSICION.csv`](MATRIZ_TRANSICION.csv) carácter por carácter, sin expresiones regulares. La matriz incluye identificadores, palabras reservadas, literales de carácter y cadena, operadores, delimitadores y diagnósticos léxicos. Consulta la [guía de la matriz](MATRIZ_TRANSICION.md) para leerla en Excel.
 
+## Cómo seguir el código
+
+Empieza en `procesar_archivo`, en [`CE.py`](CE.py). Ahí se ve el orden de las tres fases y en qué punto se detiene cada una:
+
+1. **Léxico (`tokenizar`)**: el CSV dice a qué estado pasar con cada carácter. El resultado es una lista de tokens con línea y columna.
+2. **Sintaxis (`Parser`)**: consume los tokens según la gramática y construye el árbol sintáctico. Por ejemplo, `expresion` reconoce `+` y `-`, mientras que `termino` reconoce `*` y `/`, que tienen mayor precedencia.
+3. **Semántica (`AnalizadorSemantico`)**: recorre el árbol para registrar los símbolos y comprobar declaraciones, tipos y constantes.
+
+Las funciones de dibujo y de reportes solo presentan los resultados; no reconocen tokens ni deciden si una instrucción es válida.
+
 ## Instalación y uso
 
 Requiere Python 3.10 o posterior. Pillow se usa para generar la imagen del árbol sintáctico.

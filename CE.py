@@ -1,4 +1,3 @@
-import ast as ast_mod
 import csv
 import os
 import sys
@@ -135,17 +134,11 @@ def cargar_definiciones(ruta):
     for numero, linea in secciones["COLORES"]:
         nombre, separador, valor = linea.partition("=")
         if not separador:
-            raise ValueError(
-                f"LÍNEA {numero}: SE ESPERABA NOMBRE = \"valor\""
-            )
-        try:
-            colores[nombre.strip().upper()] = ast_mod.literal_eval(
-                valor.strip()
-            )
-        except (ValueError, SyntaxError) as exc:
-            raise ValueError(
-                f"LÍNEA {numero}: COLOR INVÁLIDO ({exc})"
-            ) from exc
+            raise ValueError(f"LÍNEA {numero}: SE ESPERABA NOMBRE = CÓDIGO ANSI")
+        codigo = valor.strip()
+        if codigo and not all(p.isascii() and p.isdecimal() for p in codigo.split(";")):
+            raise ValueError(f"LÍNEA {numero}: COLOR INVÁLIDO ({codigo})")
+        colores[nombre.strip().upper()] = f"\033[{codigo}m" if codigo else ""
 
     mensajes = {}
     for numero, linea in secciones["MENSAJES"]:
@@ -324,6 +317,12 @@ def tokenizar(codigo):
     return tokens, errores
 
 
+def nodo_en(token, tipo, valor=None, hijos=None):
+    return Nodo(tipo, token.linea, token.columna, valor, [] if hijos is None else hijos)
+
+
+# El parser sigue la gramática: las expresiones de menor precedencia
+# llaman a las de mayor precedencia para reconocer sus operandos.
 class Parser:
     def __init__(self, tokens):
         self.tokens = list(tokens)
@@ -372,20 +371,14 @@ class Parser:
         if self.tipo() != "EOF":
             self.error(201)
 
-        principal = Nodo(
-            "principal", inicio.linea, inicio.columna,
-            hijos=[bloque] if bloque else [],
-        )
-        return Nodo(
-            "programa", inicio.linea, inicio.columna,
-            hijos=[principal],
-        )
+        principal = nodo_en(inicio, "principal", hijos=[bloque])
+        return nodo_en(inicio, "programa", hijos=[principal])
 
     def bloque(self):
         inicio = self.actual()
         if self.tipo() != "LLAVE_IZQ":
             self.error(202 if self.tipo() == "EOF" else 201)
-            return Nodo("bloque", inicio.linea, inicio.columna)
+            return nodo_en(inicio, "bloque")
 
         self.avanzar()
         hijos = []
@@ -405,7 +398,7 @@ class Parser:
         else:
             self.error(202)
 
-        return Nodo("bloque", inicio.linea, inicio.columna, hijos=hijos)
+        return nodo_en(inicio, "bloque", hijos=hijos)
 
     def instruccion(self):
         if self.tipo() in TIPOS_DATO or self.tipo() == "CONSTANTE":
@@ -454,15 +447,9 @@ class Parser:
 
         self.esperar("PUNTO_COMA")
 
-        return Nodo(
-            "declaracion", inicio.linea, inicio.columna,
-            valor={
-                "tipo": tipo,
-                "nombre": nombre,
-                "constante": es_constante,
-            },
-            hijos=[expresion] if expresion is not None else [],
-        )
+        datos = {"tipo": tipo, "nombre": nombre, "constante": es_constante}
+        hijos = [expresion] if expresion is not None else []
+        return nodo_en(inicio, "declaracion", valor=datos, hijos=hijos)
 
     def asignacion(self):
         inicio = self.actual()
@@ -476,10 +463,7 @@ class Parser:
         expresion = self.expresion()
         self.esperar("PUNTO_COMA")
 
-        return Nodo(
-            "asignacion", inicio.linea, inicio.columna,
-            valor=nombre, hijos=[expresion],
-        )
+        return nodo_en(inicio, "asignacion", valor=nombre, hijos=[expresion])
 
     def decision(self):
         inicio = self.avanzar()
@@ -493,7 +477,7 @@ class Parser:
             self.avanzar()
             hijos.append(self.bloque())
 
-        return Nodo("si", inicio.linea, inicio.columna, hijos=hijos)
+        return nodo_en(inicio, "si", hijos=hijos)
 
     def ciclo(self):
         inicio = self.avanzar()
@@ -502,20 +486,14 @@ class Parser:
         self.esperar("PAR_DER")
         cuerpo = self.bloque()
 
-        return Nodo(
-            "mientras", inicio.linea, inicio.columna,
-            hijos=[condicion, cuerpo],
-        )
+        return nodo_en(inicio, "mientras", hijos=[condicion, cuerpo])
 
     def retorno(self):
         inicio = self.avanzar()
         expresion = self.expresion()
         self.esperar("PUNTO_COMA")
 
-        return Nodo(
-            "retornar", inicio.linea, inicio.columna,
-            hijos=[expresion],
-        )
+        return nodo_en(inicio, "retornar", hijos=[expresion])
 
     def mostrar(self):
         inicio = self.avanzar()
@@ -526,58 +504,33 @@ class Parser:
             argumentos.append(self.argumento_mostrar())
         self.esperar("PAR_DER")
         self.esperar("PUNTO_COMA")
-        return Nodo(
-            "mostrar", inicio.linea, inicio.columna, hijos=argumentos,
-        )
+        return nodo_en(inicio, "mostrar", hijos=argumentos)
 
     def argumento_mostrar(self):
         if self.tipo() == "LITERAL_CADENA":
             token = self.avanzar()
-            return Nodo("cadena", token.linea, token.columna, valor=token.lexema)
+            return nodo_en(token, "cadena", valor=token.lexema)
         return self.expresion()
 
     def control(self):
         inicio = self.avanzar()
         self.esperar("PUNTO_COMA")
 
-        return Nodo(inicio.tipo.lower(), inicio.linea, inicio.columna)
+        return nodo_en(inicio, inicio.tipo.lower())
 
     def condicion(self):
         return self.o_logico()
 
     def o_logico(self):
-        izquierda = self.y_logico()
-
-        while self.tipo() == "OPERADOR" and self.lexema() == "||":
-            operador = self.avanzar()
-            derecha = self.y_logico()
-            izquierda = Nodo(
-                "logica", operador.linea, operador.columna,
-                valor="||", hijos=[izquierda, derecha],
-            )
-
-        return izquierda
+        return self.operacion_repetida(self.y_logico(), self.y_logico, ("||",), "logica")
 
     def y_logico(self):
-        izquierda = self.negacion()
-
-        while self.tipo() == "OPERADOR" and self.lexema() == "&&":
-            operador = self.avanzar()
-            derecha = self.negacion()
-            izquierda = Nodo(
-                "logica", operador.linea, operador.columna,
-                valor="&&", hijos=[izquierda, derecha],
-            )
-
-        return izquierda
+        return self.operacion_repetida(self.negacion(), self.negacion, ("&&",), "logica")
 
     def negacion(self):
         if self.tipo() == "OPERADOR" and self.lexema() == "!":
             operador = self.avanzar()
-            return Nodo(
-                "negacion", operador.linea, operador.columna,
-                hijos=[self.negacion()],
-            )
+            return nodo_en(operador, "negacion", hijos=[self.negacion()])
 
         return self.comparacion()
 
@@ -590,37 +543,21 @@ class Parser:
         ):
             operador = self.avanzar()
             derecha = self.expresion()
-            return Nodo(
-                "comparacion", operador.linea, operador.columna,
-                valor=operador.lexema, hijos=[izquierda, derecha],
-            )
+            return nodo_en(operador, "comparacion", operador.lexema, [izquierda, derecha])
 
         return izquierda
 
     def expresion(self):
-        izquierda = self.termino()
-
-        while self.tipo() == "OPERADOR" and self.lexema() in ("+", "-"):
-            operador = self.avanzar()
-            derecha = self.termino()
-            izquierda = Nodo(
-                "binaria", operador.linea, operador.columna,
-                valor=operador.lexema, hijos=[izquierda, derecha],
-            )
-
-        return izquierda
+        return self.operacion_repetida(self.termino(), self.termino, ("+", "-"), "binaria")
 
     def termino(self):
-        izquierda = self.factor()
+        return self.operacion_repetida(self.factor(), self.factor, ("*", "/"), "binaria")
 
-        while self.tipo() == "OPERADOR" and self.lexema() in ("*", "/"):
+    def operacion_repetida(self, izquierda, leer_operando, operadores, tipo_nodo):
+        while self.tipo() == "OPERADOR" and self.lexema() in operadores:
             operador = self.avanzar()
-            derecha = self.factor()
-            izquierda = Nodo(
-                "binaria", operador.linea, operador.columna,
-                valor=operador.lexema, hijos=[izquierda, derecha],
-            )
-
+            derecha = leer_operando()
+            izquierda = nodo_en(operador, tipo_nodo, operador.lexema, [izquierda, derecha])
         return izquierda
 
     def factor(self):
@@ -628,31 +565,19 @@ class Parser:
 
         if token.tipo == "ID":
             self.avanzar()
-            return Nodo(
-                "identificador", token.linea, token.columna,
-                valor=token.lexema,
-            )
+            return nodo_en(token, "identificador", valor=token.lexema)
 
         if token.tipo == "NUMERO_ENTERO":
             self.avanzar()
-            return Nodo(
-                "literal", token.linea, token.columna,
-                valor=("entero", int(token.lexema)),
-            )
+            return nodo_en(token, "literal", valor=("entero", int(token.lexema)))
 
         if token.tipo == "NUMERO_DECIMAL":
             self.avanzar()
-            return Nodo(
-                "literal", token.linea, token.columna,
-                valor=("decimal", Decimal(token.lexema)),
-            )
+            return nodo_en(token, "literal", valor=("decimal", Decimal(token.lexema)))
 
         if token.tipo == "LITERAL_CARACTER":
             self.avanzar()
-            return Nodo(
-                "literal", token.linea, token.columna,
-                valor=("caracter", token.lexema[1:-1]),
-            )
+            return nodo_en(token, "literal", valor=("caracter", token.lexema[1:-1]))
 
         if token.tipo == "PAR_IZQ":
             self.avanzar()
@@ -661,7 +586,7 @@ class Parser:
             return contenido
 
         self.error(201)
-        return Nodo("error", token.linea, token.columna)
+        return nodo_en(token, "error")
 
 
 def analizar_sintactico(tokens):
@@ -850,12 +775,14 @@ class AnalizadorSemantico:
                 self.error(303, argumento, "mostrar")
 
     def visitar_romper(self, nodo):
-        if self.profundidad_ciclo == 0:
-            self.error(305, nodo, "romper")
+        self.verificar_control_ciclo(nodo)
 
     def visitar_continuar(self, nodo):
+        self.verificar_control_ciclo(nodo)
+
+    def verificar_control_ciclo(self, nodo):
         if self.profundidad_ciclo == 0:
-            self.error(305, nodo, "continuar")
+            self.error(305, nodo, nodo.tipo)
 
     def verificar_condicion(self, nodo):
         tipo = self.tipo_expresion(nodo)
@@ -878,47 +805,21 @@ class AnalizadorSemantico:
         if nodo.tipo == "literal":
             return nodo.valor[0]
 
-        if nodo.tipo == "binaria":
+        if nodo.tipo in ("binaria", "comparacion", "logica"):
             izquierda = self.tipo_expresion(nodo.hijos[0])
             derecha = self.tipo_expresion(nodo.hijos[1])
             if izquierda is None or derecha is None:
                 return None
 
-            numericos = ("entero", "decimal")
-            if izquierda not in numericos or derecha not in numericos:
-                self.error(303, nodo, nodo.valor)
-                return None
-
-            if "decimal" in (izquierda, derecha):
-                return "decimal"
-            return "entero"
-
-        if nodo.tipo == "comparacion":
-            izquierda = self.tipo_expresion(nodo.hijos[0])
-            derecha = self.tipo_expresion(nodo.hijos[1])
-            if izquierda is None or derecha is None:
-                return None
-
-            numericos = ("entero", "decimal")
-            if nodo.valor in ("==", "!="):
-                if izquierda in numericos and derecha in numericos:
-                    return "logico"
-                if izquierda == "caracter" and derecha == "caracter":
-                    return "logico"
-            else:
-                if izquierda in numericos and derecha in numericos:
-                    return "logico"
-
-            self.error(303, nodo, nodo.valor)
-            return None
-
-        if nodo.tipo == "logica":
-            izquierda = self.tipo_expresion(nodo.hijos[0])
-            derecha = self.tipo_expresion(nodo.hijos[1])
-            if izquierda is None or derecha is None:
-                return None
-
-            if izquierda == "logico" and derecha == "logico":
+            tipos = (izquierda, derecha)
+            numericos = all(tipo in ("entero", "decimal") for tipo in tipos)
+            if nodo.tipo == "binaria" and numericos:
+                return "decimal" if "decimal" in tipos else "entero"
+            if nodo.tipo == "comparacion" and (
+                numericos or (nodo.valor in ("==", "!=") and tipos == ("caracter", "caracter"))
+            ):
+                return "logico"
+            if nodo.tipo == "logica" and tipos == ("logico", "logico"):
                 return "logico"
 
             self.error(303, nodo, nodo.valor)
@@ -982,10 +883,6 @@ def tabla_tokens_texto(tokens):
         )
 
     return "\n".join(lineas)
-
-
-def mostrar_tokens(tokens):
-    print(tabla_tokens_texto(tokens))
 
 
 def linea_error(error, color="", reset=""):
@@ -1414,8 +1311,8 @@ def contenido_simbolos(nombre, tabla):
     return "\n".join(partes) + "\n"
 
 
-def contenido_analisis(arbol):
-    return generar_codigo(arbol)
+def agregar_seccion(partes, titulo, contenido):
+    partes.extend(["", titulo, "=" * len(titulo), contenido])
 
 
 def contenido_reporte(nombre, tokens, errores_lexicos, arbol,
@@ -1436,60 +1333,22 @@ def contenido_reporte(nombre, tokens, errores_lexicos, arbol,
         f"ERRORES LÉXICOS: {len(errores_lexicos)}",
         f"ERRORES SINTÁCTICOS: {len(errores_sintacticos)}",
         f"ERRORES SEMÁNTICOS: {len(errores_semanticos)}",
-        "",
-        "TOKENS",
-        "======",
-        tabla_tokens_texto(tokens),
     ]
 
+    agregar_seccion(partes, "TOKENS", tabla_tokens_texto(tokens))
     if errores_lexicos:
-        partes.extend([
-            "",
-            "ERRORES LÉXICOS",
-            "===============",
-            texto_errores(errores_lexicos),
-        ])
-
+        agregar_seccion(partes, "ERRORES LÉXICOS", texto_errores(errores_lexicos))
     if arbol is not None:
-        partes.extend([
-            "",
-            "ÁRBOL SINTÁCTICO",
-            "================",
-            arbol_dibujado_texto(arbol),
-        ])
-
+        agregar_seccion(partes, "ÁRBOL SINTÁCTICO", arbol_dibujado_texto(arbol))
     if errores_sintacticos:
-        partes.extend([
-            "",
-            "ERRORES SINTÁCTICOS",
-            "===================",
-            texto_errores(errores_sintacticos),
-        ])
-
+        agregar_seccion(partes, "ERRORES SINTÁCTICOS", texto_errores(errores_sintacticos))
     if tabla is not None:
-        partes.extend([
-            "",
-            "TABLA DE SÍMBOLOS",
-            "=================",
-            tabla_simbolos_texto(tabla),
-        ])
-
+        agregar_seccion(partes, "TABLA DE SÍMBOLOS", tabla_simbolos_texto(tabla))
         referencias = referencias_texto(tabla)
         if referencias:
-            partes.extend([
-                "",
-                "REFERENCIAS POR SÍMBOLO",
-                "=======================",
-                referencias,
-            ])
-
+            agregar_seccion(partes, "REFERENCIAS POR SÍMBOLO", referencias)
     if errores_semanticos:
-        partes.extend([
-            "",
-            "ERRORES SEMÁNTICOS",
-            "==================",
-            texto_errores(errores_semanticos),
-        ])
+        agregar_seccion(partes, "ERRORES SEMÁNTICOS", texto_errores(errores_semanticos))
 
     return "\n".join(partes) + "\n"
 
@@ -1564,7 +1423,7 @@ def procesar_archivo(nombre, codigo):
         f"{CIAN}ERRORES LÉXICOS:{RESET} {len(errores_lexicos)}"
     )
     print(GRIS + "-" * 72 + RESET)
-    mostrar_tokens(tokens)
+    print(tabla_tokens_texto(tokens))
 
     if errores_lexicos:
         mostrar_errores("ERRORES LÉXICOS", errores_lexicos)
@@ -1613,7 +1472,7 @@ def procesar_archivo(nombre, codigo):
         )
         return 1
 
-    escribir_archivo(CONFIG["ARCHIVO_ANALISIS"], contenido_analisis(arbol))
+    escribir_archivo(CONFIG["ARCHIVO_ANALISIS"], generar_codigo(arbol))
 
     escribir_reporte(
         nombre, tokens, errores_lexicos, arbol,
