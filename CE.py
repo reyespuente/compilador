@@ -1,17 +1,15 @@
 import csv
 import os
 import sys
-import textwrap
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import NamedTuple
 
-ARCHIVO_DEFINICIONES = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "DEFINICIONES.TXT"
-)
-ARCHIVO_MATRIZ = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "MATRIZ_TRANSICION.csv"
-)
+import salidas
+
+CARPETA = os.path.dirname(os.path.abspath(__file__))
+ARCHIVO_DEFINICIONES = os.path.join(CARPETA, "DEFINICIONES.TXT")
+ARCHIVO_MATRIZ = os.path.join(CARPETA, "MATRIZ_TRANSICION.csv")
 ESTADO_INICIAL = "q0"
 ESTADO_RECHAZO = "q_error"
 
@@ -68,6 +66,7 @@ class Nodo:
     valor: object = None
     hijos: list = field(default_factory=list)
     id_simbolo: int | None = None
+    tipo_dato: str | None = None
 
 
 def _leer_secciones(ruta):
@@ -98,19 +97,23 @@ def _leer_secciones(ruta):
 
 
 def _valor_config(secciones, clave):
-    for numero, linea in secciones.get("CONFIG", []):
+    for _, linea in secciones["CONFIG"]:
         nombre, separador, valor = linea.partition("=")
         if separador and nombre.strip().upper() == clave:
             valor = valor.strip()
-            if (
-                len(valor) >= 2
-                and valor[0] == valor[-1]
-                and valor[0] in "'\""
-            ):
-                valor = valor[1:-1]
+            if len(valor) >= 2 and valor[0] == valor[-1] and valor[0] in "'\"":
+                return valor[1:-1]
             return valor
 
     raise ValueError(f"FALTA LA CLAVE {clave} EN [CONFIG]")
+
+
+def _leer_pares(seccion, formato):
+    for numero, linea in seccion:
+        clave, separador, valor = linea.partition("=")
+        if not separador:
+            raise ValueError(f"LÍNEA {numero}: SE ESPERABA {formato}")
+        yield numero, clave.strip(), valor.strip()
 
 
 def cargar_definiciones(ruta):
@@ -121,55 +124,27 @@ def cargar_definiciones(ruta):
     if faltantes:
         raise ValueError("FALTAN SECCIONES: " + ", ".join(faltantes))
 
-    config = {
-        "EXTENSION": _valor_config(secciones, "EXTENSION"),
-        "ANCHO_TAB": int(_valor_config(secciones, "ANCHO_TAB")),
-        "ARCHIVO_SIMBOLOS": _valor_config(secciones, "ARCHIVO_SIMBOLOS"),
-        "ARCHIVO_ANALISIS": _valor_config(secciones, "ARCHIVO_ANALISIS"),
-        "ARCHIVO_REPORTE": _valor_config(secciones, "ARCHIVO_REPORTE"),
-        "ARCHIVO_ARBOL": _valor_config(secciones, "ARCHIVO_ARBOL"),
-    }
+    claves = ("EXTENSION", "ANCHO_TAB", "ARCHIVO_SIMBOLOS", "ARCHIVO_ANALISIS",
+              "ARCHIVO_INTERMEDIO", "ARCHIVO_ENSAMBLADOR", "ARCHIVO_REPORTE", "ARCHIVO_ARBOL")
+    config = {clave: _valor_config(secciones, clave) for clave in claves}
+    config["ANCHO_TAB"] = int(config["ANCHO_TAB"])
 
     colores = {}
-    for numero, linea in secciones["COLORES"]:
-        nombre, separador, valor = linea.partition("=")
-        if not separador:
-            raise ValueError(f"LÍNEA {numero}: SE ESPERABA NOMBRE = CÓDIGO ANSI")
-        codigo = valor.strip()
+    for numero, nombre, codigo in _leer_pares(secciones["COLORES"], "NOMBRE = CÓDIGO ANSI"):
         if codigo and not all(p.isascii() and p.isdecimal() for p in codigo.split(";")):
             raise ValueError(f"LÍNEA {numero}: COLOR INVÁLIDO ({codigo})")
-        colores[nombre.strip().upper()] = f"\033[{codigo}m" if codigo else ""
+        colores[nombre.upper()] = f"\033[{codigo}m" if codigo else ""
 
-    mensajes = {}
-    for numero, linea in secciones["MENSAJES"]:
-        grupo, separador, codigo = linea.partition("=")
-        if not separador:
-            raise ValueError(
-                f"LÍNEA {numero}: SE ESPERABA GRUPO = CÓDIGO"
-            )
-        mensajes[grupo.strip().upper()] = int(codigo.strip())
-
-    errores = {}
-    for numero, linea in secciones["ERRORES"]:
-        codigo, separador, mensaje = linea.partition("=")
-        if not separador:
-            raise ValueError(
-                f"LÍNEA {numero}: SE ESPERABA CÓDIGO = MENSAJE"
-            )
-        errores[int(codigo.strip())] = mensaje.strip()
+    mensajes = {grupo.upper(): int(codigo) for _, grupo, codigo in
+                _leer_pares(secciones["MENSAJES"], "GRUPO = CÓDIGO")}
+    errores = {int(codigo): mensaje for _, codigo, mensaje in
+               _leer_pares(secciones["ERRORES"], "CÓDIGO = MENSAJE")}
 
     for grupo, codigo in mensajes.items():
         if codigo not in errores:
-            raise ValueError(
-                f"FALTA EL MENSAJE {codigo} DE {grupo} EN [ERRORES]"
-            )
+            raise ValueError(f"FALTA EL MENSAJE {codigo} DE {grupo} EN [ERRORES]")
 
-    return {
-        "config": config,
-        "colores": colores,
-        "mensajes": mensajes,
-        "errores": errores,
-    }
+    return {"config": config, "colores": colores, "mensajes": mensajes, "errores": errores}
 
 
 def cargar_matriz(ruta, mensajes):
@@ -249,15 +224,6 @@ TIPOS_DATO = {
 
 OPERADORES_RELACIONALES = {"==", "!=", "<", ">", "<=", ">="}
 
-PRECEDENCIA = {
-    "||": 1,
-    "&&": 2,
-    "==": 3, "!=": 3, "<": 3, ">": 3, "<=": 3, ">=": 3,
-    "+": 4, "-": 4,
-    "*": 5, "/": 5,
-}
-
-
 def avanzar_columna(columna, texto):
     for caracter in texto:
         if caracter == "\t":
@@ -272,11 +238,9 @@ def reconocer_lexema(codigo, inicio):
     tipo = "ERROR_SIMBOLO"
     fin = inicio + 1
 
-    # Conservar el último estado final permite distinguir, por ejemplo, < de <=.
     for pos in range(inicio, len(codigo)):
         clase = CLASE_POR_CARACTER.get(codigo[pos], "OTRO")
         destino = transiciones[clase]
-        # El carácter que provocó el rechazo queda para el siguiente lexema.
         if destino == ESTADO_RECHAZO:
             break
         resultado, transiciones = MATRIZ_TRANSICION[destino]
@@ -321,8 +285,6 @@ def nodo_en(token, tipo, valor=None, hijos=None):
     return Nodo(tipo, token.linea, token.columna, valor, [] if hijos is None else hijos)
 
 
-# El parser sigue la gramática: las expresiones de menor precedencia
-# llaman a las de mayor precedencia para reconocer sus operandos.
 class Parser:
     def __init__(self, tokens):
         self.tokens = list(tokens)
@@ -401,24 +363,21 @@ class Parser:
         return nodo_en(inicio, "bloque", hijos=hijos)
 
     def instruccion(self):
-        if self.tipo() in TIPOS_DATO or self.tipo() == "CONSTANTE":
+        tipo = self.tipo()
+        if tipo in TIPOS_DATO or tipo == "CONSTANTE":
             return self.declaracion()
-        if self.tipo() == "ID":
+        if tipo == "ID":
             return self.asignacion()
-        if self.tipo() == "SI":
-            return self.decision()
-        if self.tipo() == "MIENTRAS":
-            return self.ciclo()
-        if self.tipo() == "LLAVE_IZQ":
+        if tipo in ("SI", "MIENTRAS"):
+            return self.control_condicional()
+        if tipo == "LLAVE_IZQ":
             return self.bloque()
-        if self.tipo() == "RETORNAR":
+        if tipo == "RETORNAR":
             return self.retorno()
-        if self.tipo() == "MOSTRAR":
+        if tipo == "MOSTRAR":
             return self.mostrar()
-        if self.tipo() in ("ROMPER", "CONTINUAR"):
+        if tipo in ("ROMPER", "CONTINUAR"):
             return self.control()
-
-        return None
 
     def declaracion(self):
         inicio = self.actual()
@@ -465,28 +424,16 @@ class Parser:
 
         return nodo_en(inicio, "asignacion", valor=nombre, hijos=[expresion])
 
-    def decision(self):
+    def control_condicional(self):
         inicio = self.avanzar()
         self.esperar("PAR_IZQ")
         condicion = self.condicion()
         self.esperar("PAR_DER")
-        bloque_si = self.bloque()
-
-        hijos = [condicion, bloque_si]
-        if self.tipo() == "SINO":
+        hijos = [condicion, self.bloque()]
+        if inicio.tipo == "SI" and self.tipo() == "SINO":
             self.avanzar()
             hijos.append(self.bloque())
-
-        return nodo_en(inicio, "si", hijos=hijos)
-
-    def ciclo(self):
-        inicio = self.avanzar()
-        self.esperar("PAR_IZQ")
-        condicion = self.condicion()
-        self.esperar("PAR_DER")
-        cuerpo = self.bloque()
-
-        return nodo_en(inicio, "mientras", hijos=[condicion, cuerpo])
+        return nodo_en(inicio, inicio.tipo.lower(), hijos=hijos)
 
     def retorno(self):
         inicio = self.avanzar()
@@ -598,32 +545,28 @@ def analizar_sintactico(tokens):
 class TablaSimbolos:
     def __init__(self):
         self.simbolos = {}
-        self.registros = []
-        self.siguiente_id = 1
+
+    @property
+    def registros(self):
+        return self.simbolos.values()
 
     def buscar(self, nombre):
         return self.simbolos.get(nombre)
 
-    def existe(self, nombre):
-        return nombre in self.simbolos
-
-    def declarar(self, nombre, categoria, tipo, valor, modificable,
-                 linea, columna):
+    def declarar(self, nombre, categoria, tipo, inicializador, modificable, linea, columna):
         registro = {
-            "id": self.siguiente_id,
+            "id": len(self.simbolos) + 1,
             "nombre": nombre,
             "categoria": categoria,
             "tipo": tipo,
-            "valor": valor,
+            "inicializador": inicializador,
             "modificable": modificable,
             "linea": linea,
             "columna": columna,
             "usos": [],
             "almacenamiento": None,
         }
-        self.siguiente_id += 1
         self.simbolos[nombre] = registro
-        self.registros.append(registro)
         return registro
 
     def registrar_uso(self, nombre, linea, columna):
@@ -633,10 +576,7 @@ class TablaSimbolos:
 
 
 def compatible(destino, origen):
-    return (
-        destino == origen
-        or (destino == "decimal" and origen == "entero")
-    )
+    return destino == origen or (destino == "decimal" and origen == "entero")
 
 
 class AnalizadorSemantico:
@@ -658,23 +598,17 @@ class AnalizadorSemantico:
     def visitar(self, nodo):
         if nodo is None:
             return
+        if nodo.tipo in ("programa", "principal", "bloque"):
+            for hijo in nodo.hijos:
+                self.visitar(hijo)
+            return
+        if nodo.tipo in ("romper", "continuar"):
+            if self.profundidad_ciclo == 0:
+                self.error(305, nodo, nodo.tipo)
+            return
         metodo = getattr(self, f"visitar_{nodo.tipo}", None)
         if metodo is not None:
             metodo(nodo)
-
-    def visitar_programa(self, nodo):
-        for hijo in nodo.hijos:
-            self.visitar(hijo)
-
-    def visitar_principal(self, nodo):
-        bloque = nodo.hijos[0] if nodo.hijos else None
-        if bloque is not None:
-            for instruccion in bloque.hijos:
-                self.visitar(instruccion)
-
-    def visitar_bloque(self, nodo):
-        for instruccion in nodo.hijos:
-            self.visitar(instruccion)
 
     def visitar_declaracion(self, nodo):
         datos = nodo.valor
@@ -683,30 +617,21 @@ class AnalizadorSemantico:
         if not nombre or not tipo:
             return
 
-        if self.tabla.existe(nombre):
+        if self.tabla.buscar(nombre) is not None:
             self.error(302, nodo, nombre)
             return
 
         expresion = nodo.hijos[0] if nodo.hijos else None
-        valor = None
-
         if expresion is not None:
             tipo_expresion = self.tipo_expresion(expresion)
-            compatible_expresion = True
-            if (
-                tipo_expresion is not None
-                and not compatible(tipo, tipo_expresion)
-            ):
+            if tipo_expresion is not None and not compatible(tipo, tipo_expresion):
                 self.error(306, nodo, nombre)
-                compatible_expresion = False
-            if compatible_expresion and expresion.tipo == "literal":
-                valor = expresion.valor[1]
 
         registro = self.tabla.declarar(
             nombre,
             "CONSTANTE" if datos.get("constante") else "VARIABLE",
             tipo,
-            valor,
+            expresion,
             not datos.get("constante"),
             nodo.linea,
             nodo.columna,
@@ -732,29 +657,21 @@ class AnalizadorSemantico:
             self.error(304, nodo, nodo.valor)
             return
 
-        if (
-            tipo_expresion is not None
-            and not compatible(registro["tipo"], tipo_expresion)
-        ):
+        if tipo_expresion is not None and not compatible(registro["tipo"], tipo_expresion):
             self.error(306, nodo, nodo.valor)
 
     def visitar_si(self, nodo):
-        condicion = nodo.hijos[0]
-        bloque_si = nodo.hijos[1]
-        bloque_sino = nodo.hijos[2] if len(nodo.hijos) > 2 else None
-
+        condicion, *bloques = nodo.hijos
         self.verificar_condicion(condicion)
-        self.visitar_bloque(bloque_si)
-
-        if bloque_sino is not None:
-            self.visitar_bloque(bloque_sino)
+        for bloque in bloques:
+            self.visitar(bloque)
 
     def visitar_mientras(self, nodo):
         condicion, cuerpo = nodo.hijos
         self.verificar_condicion(condicion)
 
         self.profundidad_ciclo += 1
-        self.visitar_bloque(cuerpo)
+        self.visitar(cuerpo)
         self.profundidad_ciclo -= 1
 
     def visitar_retornar(self, nodo):
@@ -774,20 +691,14 @@ class AnalizadorSemantico:
             if tipo is not None and tipo not in TIPOS_DATO.values():
                 self.error(303, argumento, "mostrar")
 
-    def visitar_romper(self, nodo):
-        self.verificar_control_ciclo(nodo)
-
-    def visitar_continuar(self, nodo):
-        self.verificar_control_ciclo(nodo)
-
-    def verificar_control_ciclo(self, nodo):
-        if self.profundidad_ciclo == 0:
-            self.error(305, nodo, nodo.tipo)
-
     def verificar_condicion(self, nodo):
         tipo = self.tipo_expresion(nodo)
         if tipo is not None and tipo != "logico":
             self.error(303, nodo, "condición")
+
+    def anotar_tipo(self, nodo, tipo):
+        nodo.tipo_dato = tipo
+        return tipo
 
     def tipo_expresion(self, nodo):
         if nodo is None:
@@ -800,10 +711,10 @@ class AnalizadorSemantico:
                 return None
             nodo.id_simbolo = registro["id"]
             self.tabla.registrar_uso(nodo.valor, nodo.linea, nodo.columna)
-            return registro["tipo"]
+            return self.anotar_tipo(nodo, registro["tipo"])
 
         if nodo.tipo == "literal":
-            return nodo.valor[0]
+            return self.anotar_tipo(nodo, nodo.valor[0])
 
         if nodo.tipo in ("binaria", "comparacion", "logica"):
             izquierda = self.tipo_expresion(nodo.hijos[0])
@@ -814,13 +725,14 @@ class AnalizadorSemantico:
             tipos = (izquierda, derecha)
             numericos = all(tipo in ("entero", "decimal") for tipo in tipos)
             if nodo.tipo == "binaria" and numericos:
-                return "decimal" if "decimal" in tipos else "entero"
+                tipo = "decimal" if "decimal" in tipos else "entero"
+                return self.anotar_tipo(nodo, tipo)
             if nodo.tipo == "comparacion" and (
                 numericos or (nodo.valor in ("==", "!=") and tipos == ("caracter", "caracter"))
             ):
-                return "logico"
+                return self.anotar_tipo(nodo, "logico")
             if nodo.tipo == "logica" and tipos == ("logico", "logico"):
-                return "logico"
+                return self.anotar_tipo(nodo, "logico")
 
             self.error(303, nodo, nodo.valor)
             return None
@@ -830,7 +742,7 @@ class AnalizadorSemantico:
             if tipo is None:
                 return None
             if tipo == "logico":
-                return "logico"
+                return self.anotar_tipo(nodo, "logico")
 
             self.error(303, nodo, "!")
             return None
@@ -839,254 +751,13 @@ class AnalizadorSemantico:
 
 
 def analizar_semantico(arbol):
-    analizador = AnalizadorSemantico()
-    return analizador.analizar(arbol)
-
-
-def formatear_tabla(encabezados, filas, alineaciones=None):
-    if not filas:
-        return ""
-
-    columnas = len(encabezados)
-    anchos = []
-    for indice in range(columnas):
-        valores = [str(fila[indice]) for fila in filas]
-        valores.append(encabezados[indice])
-        anchos.append(max(len(valor) for valor in valores))
-
-    def linea(valores):
-        partes = []
-        for indice, valor in enumerate(valores):
-            texto = str(valor)
-            if alineaciones and alineaciones[indice] == "derecha":
-                partes.append(texto.rjust(anchos[indice]))
-            else:
-                partes.append(texto.ljust(anchos[indice]))
-        return "  ".join(partes).rstrip()
-
-    resultado = [linea(encabezados)]
-    resultado.extend(linea(fila) for fila in filas)
-    return "\n".join(resultado)
-
-
-def tabla_tokens_texto(tokens):
-    lineas = [f"{'LÍN':>4}:{'COL':<4} {'TIPO':<16} LEXEMA"]
-
-    if not tokens:
-        lineas.append("(SIN TOKENS)")
-        return "\n".join(lineas)
-
-    for token in tokens:
-        lineas.append(
-            f"{token.linea:>4}:{token.columna:<4} "
-            f"{token.tipo:<16} {token.lexema}"
-        )
-
-    return "\n".join(lineas)
-
-
-def linea_error(error, color="", reset=""):
-    detalle = f" ({error.lexema!r})" if error.lexema else ""
-    return (
-        f"{color}ERROR {error.codigo}{reset} EN "
-        f"{error.linea}:{error.columna}: {error.mensaje}{detalle}"
-    )
-
-
-def texto_errores(errores):
-    return "\n".join(linea_error(error) for error in errores) or "(SIN ERRORES)"
+    return AnalizadorSemantico().analizar(arbol)
 
 
 def mostrar_errores(titulo, errores):
-    print()
-    print(f"{ROJO}{titulo}{RESET}")
+    print(f"\n{ROJO}{titulo}{RESET}")
     for error in errores:
-        print(linea_error(error, ROJO, RESET))
-
-
-def recorrer_ast(nodo, nivel=0):
-    yield nivel, nodo
-    for hijo in nodo.hijos:
-        if hijo is not None:
-            yield from recorrer_ast(hijo, nivel + 1)
-
-
-def detalle_ast(nodo):
-    if nodo.tipo == "principal":
-        return "entero principal()"
-    if nodo.tipo == "declaracion":
-        datos = nodo.valor
-        prefijo = "constante " if datos.get("constante") else ""
-        detalle = f"{prefijo}{datos.get('tipo')} {datos.get('nombre')}"
-    elif nodo.tipo in ("asignacion", "identificador"):
-        detalle = str(nodo.valor)
-    elif nodo.tipo in ("binaria", "comparacion", "logica", "cadena"):
-        return str(nodo.valor)
-    elif nodo.tipo == "negacion":
-        return "!"
-    elif nodo.tipo == "literal":
-        tipo, valor = nodo.valor
-        return f"{tipo} {valor_texto(valor)}"
-    else:
-        return ""
-
-    if nodo.id_simbolo is not None:
-        detalle += f" (ID {nodo.id_simbolo})"
-    return detalle
-
-
-def etiqueta_arbol(nodo):
-    etiqueta = nodo.tipo.upper()
-    detalle = detalle_ast(nodo)
-    if detalle:
-        etiqueta += f" ({detalle})"
-    return etiqueta
-
-
-def dibujar_arbol(nodo, prefijo="", es_ultimo=True, es_raiz=True,
-                  lineas=None):
-    if lineas is None:
-        lineas = []
-
-    etiqueta = etiqueta_arbol(nodo)
-    if es_raiz:
-        lineas.append(etiqueta)
-        extension = ""
-    else:
-        conector = "└── " if es_ultimo else "├── "
-        lineas.append(prefijo + conector + etiqueta)
-        extension = "    " if es_ultimo else "│   "
-
-    hijos = [hijo for hijo in nodo.hijos if hijo is not None]
-    nuevo_prefijo = prefijo + extension
-
-    for indice, hijo in enumerate(hijos):
-        dibujar_arbol(
-            hijo,
-            nuevo_prefijo,
-            indice == len(hijos) - 1,
-            False,
-            lineas,
-        )
-
-    return lineas
-
-
-def arbol_dibujado_texto(arbol):
-    if arbol is None:
-        return ""
-    return "\n".join(dibujar_arbol(arbol))
-
-
-def mostrar_arbol(arbol):
-    texto = arbol_dibujado_texto(arbol)
-    if texto:
-        print(texto)
-    else:
-        print(f"{GRIS}(ÁRBOL VACÍO){RESET}")
-
-
-def _fuente_imagen(ImageFont, tamano):
-    try:
-        return ImageFont.truetype("DejaVuSansMono.ttf", tamano)
-    except OSError:
-        return ImageFont.load_default(size=tamano)
-
-
-def _lineas_nodo_imagen(nodo):
-    return [nodo.tipo.upper()] + textwrap.wrap(
-        detalle_ast(nodo), width=13, max_lines=3, placeholder="..."
-    )
-
-
-def _distribuir_arbol(arbol, separacion):
-    def medir(nodo):
-        hijos = []
-        limites = []
-        for hijo in nodo.hijos:
-            if hijo is None:
-                continue
-            plan, contorno = medir(hijo)
-            x = max(
-                (derecha + separacion - izquierda
-                 for (_, derecha), (izquierda, _) in zip(limites, contorno)),
-                default=0,
-            )
-            hijos.append((x, plan))
-            for nivel, (izquierda, derecha) in enumerate(contorno):
-                izquierda, derecha = izquierda + x, derecha + x
-                if nivel == len(limites):
-                    limites.append((izquierda, derecha))
-                else:
-                    limites[nivel] = (limites[nivel][0], derecha)
-
-        centro = (hijos[0][0] + hijos[-1][0]) // 2 if hijos else 0
-        plan = (nodo, [(x - centro, hijo) for x, hijo in hijos])
-        contorno = [(0, 0)] + [(a - centro, b - centro) for a, b in limites]
-        return plan, contorno
-
-    nodos, ramas = [], []
-
-    def colocar(plan, x, nivel):
-        nodo, hijos = plan
-        nodos.append((nodo, (x, nivel)))
-        for desplazamiento, hijo in hijos:
-            x_hijo = x + desplazamiento
-            ramas.append(((x, nivel), (x_hijo, nivel + 1)))
-            colocar(hijo, x_hijo, nivel + 1)
-
-    plan, _ = medir(arbol)
-    colocar(plan, 0, 0)
-    return nodos, ramas
-
-
-def generar_imagen_arbol(arbol, ruta, nombre):
-    from PIL import Image, ImageDraw, ImageFont
-
-    if arbol is None:
-        raise ValueError("NO HAY ÁRBOL PARA DIBUJAR")
-
-    fuente = _fuente_imagen(ImageFont, 12)
-    fuente_titulo = _fuente_imagen(ImageFont, 20)
-    radio = 54
-    paso_x, paso_y = 124, 150
-    margen, inicio_y = 24, 92
-    fondo, tinta, relleno = "#111a14", "#88eea1", "#172b1d"
-    nodos, ramas = _distribuir_arbol(arbol, paso_x)
-    izquierda = min(x for _, (x, _) in nodos)
-    derecha = max(x for _, (x, _) in nodos)
-    ultimo_nivel = max(nivel for _, (_, nivel) in nodos)
-    titulo = f"ÁRBOL SINTÁCTICO · {nombre}"
-    ancho_arbol = derecha - izquierda + 2 * (margen + radio)
-    ancho = max(ancho_arbol, int(fuente_titulo.getlength(titulo)) + 2 * margen + 1)
-    alto = inicio_y + ultimo_nivel * paso_y + radio + margen
-    imagen = Image.new("RGB", (ancho, alto), fondo)
-    dibujo = ImageDraw.Draw(imagen)
-    dibujo.text((margen, 12), titulo, font=fuente_titulo, fill=tinta)
-    origen_x = (ancho - ancho_arbol) // 2 + margen + radio - izquierda
-
-    def pixel(punto):
-        x, nivel = punto
-        return origen_x + x, inicio_y + nivel * paso_y
-
-    for padre, hijo in ramas:
-        dibujo.line([pixel(padre), pixel(hijo)], fill="#50795a", width=2)
-
-    for nodo, centro in nodos:
-        x, y = pixel(centro)
-        dibujo.ellipse(
-            (x - radio, y - radio, x + radio, y + radio),
-            fill=relleno, outline=tinta, width=2,
-        )
-        lineas = _lineas_nodo_imagen(nodo)
-        arriba = y - 7 * (len(lineas) - 1)
-        for indice, linea in enumerate(lineas):
-            dibujo.text(
-                (x, arriba + 14 * indice), linea, anchor="mm", font=fuente,
-                fill=tinta if indice == 0 else "#d5ebd8",
-            )
-
-    imagen.save(ruta, "PNG")
+        print(salidas.linea_error(error, ROJO, RESET))
 
 
 def escribir_imagen_arbol(nombre, arbol):
@@ -1095,262 +766,12 @@ def escribir_imagen_arbol(nombre, arbol):
 
     try:
         ruta = os.path.abspath(CONFIG["ARCHIVO_ARBOL"])
-        generar_imagen_arbol(arbol, ruta, nombre)
+        salidas.generar_imagen_arbol(arbol, ruta, nombre)
         print(f"{GRIS}GENERADO: {ruta}{RESET}")
     except ImportError:
-        print(
-            f"{AMARILLO}IMAGEN NO GENERADA: INSTALA PILLOW "
-            f"(pip install pillow){RESET}"
-        )
+        print(f"{AMARILLO}IMAGEN NO GENERADA: INSTALA PILLOW (pip install pillow){RESET}")
     except (OSError, ValueError) as exc:
-        print(
-            f"{ROJO}NO SE PUDO GENERAR LA IMAGEN: {exc}{RESET}"
-        )
-
-
-def valor_texto(valor):
-    if valor is None:
-        return "SIN ASIGNAR"
-    if isinstance(valor, str):
-        return repr(valor)
-    if isinstance(valor, Decimal):
-        return format(valor, "f")
-    return str(valor)
-
-
-def almacenamiento_texto(registro):
-    if registro["almacenamiento"] is None:
-        return "PENDIENTE"
-    return str(registro["almacenamiento"])
-
-
-def tabla_simbolos_texto(tabla):
-    filas = []
-    for registro in tabla.registros:
-        filas.append([
-            str(registro["id"]),
-            registro["nombre"],
-            registro["categoria"],
-            registro["tipo"],
-            valor_texto(registro["valor"]),
-            "SÍ" if registro["modificable"] else "NO",
-            f"{registro['linea']}:{registro['columna']}",
-            str(len(registro["usos"])),
-            almacenamiento_texto(registro),
-        ])
-
-    return formatear_tabla(
-        ["ID", "NOMBRE", "CATEGORÍA", "TIPO", "VALOR",
-         "MOD", "LÍN:COL", "USOS", "UBICACIÓN"],
-        filas,
-        ["derecha", "izquierda", "izquierda", "izquierda",
-         "izquierda", "izquierda", "derecha", "derecha",
-         "izquierda"],
-    )
-
-
-def referencias_texto(tabla):
-    filas = []
-    for registro in tabla.registros:
-        if not registro["usos"]:
-            continue
-        referencias = ", ".join(
-            f"{linea}:{columna}" for linea, columna in registro["usos"]
-        )
-        filas.append([
-            str(registro["id"]),
-            registro["nombre"],
-            referencias,
-        ])
-
-    return formatear_tabla(
-        ["ID", "NOMBRE", "REFERENCIAS"],
-        filas,
-        ["derecha", "izquierda", "izquierda"],
-    )
-
-
-def mostrar_tabla_simbolos(tabla):
-    texto = tabla_simbolos_texto(tabla)
-    if texto:
-        print(texto)
-    else:
-        print(f"{GRIS}(SIN SÍMBOLOS){RESET}")
-
-
-def formatear_expresion(nodo, padre=0):
-    if nodo is None or nodo.tipo == "error":
-        return "?"
-
-    if nodo.tipo == "literal":
-        _, valor = nodo.valor
-        return valor_texto(valor)
-
-    if nodo.tipo == "identificador":
-        return str(nodo.valor)
-
-    if nodo.tipo == "negacion":
-        texto = "!" + formatear_expresion(nodo.hijos[0], 6)
-        return f"({texto})" if 6 < padre else texto
-
-    if nodo.tipo in ("binaria", "comparacion", "logica"):
-        operador = nodo.valor
-        precedencia = PRECEDENCIA[operador]
-        izquierda = formatear_expresion(nodo.hijos[0], precedencia)
-        derecha = formatear_expresion(nodo.hijos[1], precedencia + 1)
-        texto = f"{izquierda} {operador} {derecha}"
-        if precedencia < padre:
-            return f"({texto})"
-        return texto
-
-    return "?"
-
-
-def lineas_bloque(bloque, nivel, encabezado=""):
-    sangria = "    " * nivel
-    prefijo = encabezado + " " if encabezado else ""
-    lineas = [f"{sangria}{prefijo}{{"]
-
-    for instruccion in bloque.hijos:
-        lineas.extend(lineas_instruccion(instruccion, nivel + 1))
-
-    lineas.append(f"{sangria}}}")
-    return lineas
-
-
-def lineas_instruccion(nodo, nivel):
-    sangria = "    " * nivel
-
-    if nodo.tipo == "declaracion":
-        datos = nodo.valor
-        expresion = nodo.hijos[0] if nodo.hijos else None
-        texto = (
-            f"{sangria}"
-            f"{'constante ' if datos.get('constante') else ''}"
-            f"{datos.get('tipo')} {datos.get('nombre')}"
-        )
-        if expresion is not None:
-            texto += f" = {formatear_expresion(expresion)}"
-        return [texto + ";"]
-
-    if nodo.tipo == "asignacion":
-        return [
-            f"{sangria}{nodo.valor} = "
-            f"{formatear_expresion(nodo.hijos[0])};"
-        ]
-
-    if nodo.tipo == "si":
-        condicion = nodo.hijos[0]
-        bloque_si = nodo.hijos[1]
-        bloque_sino = nodo.hijos[2] if len(nodo.hijos) > 2 else None
-
-        encabezado = f"si ({formatear_expresion(condicion)})"
-        lineas = lineas_bloque(bloque_si, nivel, encabezado)
-
-        if bloque_sino is not None:
-            lineas[-1] = f"{sangria}}} sino {{"
-            lineas.extend(lineas_bloque(bloque_sino, nivel)[1:])
-
-        return lineas
-
-    if nodo.tipo == "mientras":
-        condicion, cuerpo = nodo.hijos
-        encabezado = f"mientras ({formatear_expresion(condicion)})"
-        return lineas_bloque(cuerpo, nivel, encabezado)
-
-    if nodo.tipo == "bloque":
-        return lineas_bloque(nodo, nivel)
-
-    if nodo.tipo == "retornar":
-        return [
-            f"{sangria}retornar "
-            f"{formatear_expresion(nodo.hijos[0])};"
-        ]
-
-    if nodo.tipo == "mostrar":
-        argumentos = ", ".join(
-            hijo.valor if hijo.tipo == "cadena" else formatear_expresion(hijo)
-            for hijo in nodo.hijos
-        )
-        return [f"{sangria}mostrar({argumentos});"]
-
-    if nodo.tipo in ("romper", "continuar"):
-        return [f"{sangria}{nodo.tipo};"]
-
-    return [f"{sangria}/* nodo no soportado: {nodo.tipo} */"]
-
-
-def generar_codigo(arbol):
-    principal = arbol.hijos[0] if arbol.hijos else None
-    if principal is None:
-        return ""
-
-    bloque = principal.hijos[0] if principal.hijos else None
-    if bloque is None:
-        return "entero principal() {\n}\n"
-    lineas = lineas_bloque(bloque, 0, "entero principal()")
-    return "\n".join(lineas) + "\n"
-
-
-def contenido_simbolos(nombre, tabla):
-    partes = [
-        "TABLA DE SÍMBOLOS - COMPILADOR CE",
-        f"ARCHIVO: {nombre}",
-        "",
-        tabla_simbolos_texto(tabla),
-    ]
-
-    referencias = referencias_texto(tabla)
-    if referencias:
-        partes.extend([
-            "",
-            "REFERENCIAS POR SÍMBOLO",
-            referencias,
-        ])
-
-    return "\n".join(partes) + "\n"
-
-
-def agregar_seccion(partes, titulo, contenido):
-    partes.extend(["", titulo, "=" * len(titulo), contenido])
-
-
-def contenido_reporte(nombre, tokens, errores_lexicos, arbol,
-                      errores_sintacticos, tabla, errores_semanticos,
-                      estado):
-    etapas = ["LÉXICO"]
-    if arbol is not None:
-        etapas.append("SINTÁCTICO")
-    if tabla is not None:
-        etapas.append("SEMÁNTICO")
-
-    partes = [
-        "REPORTE DE ANÁLISIS - COMPILADOR CE",
-        f"ARCHIVO: {nombre}",
-        f"ESTADO: {estado}",
-        f"ETAPAS EJECUTADAS: {', '.join(etapas)}",
-        f"TOKENS: {len(tokens)}",
-        f"ERRORES LÉXICOS: {len(errores_lexicos)}",
-        f"ERRORES SINTÁCTICOS: {len(errores_sintacticos)}",
-        f"ERRORES SEMÁNTICOS: {len(errores_semanticos)}",
-    ]
-
-    agregar_seccion(partes, "TOKENS", tabla_tokens_texto(tokens))
-    if errores_lexicos:
-        agregar_seccion(partes, "ERRORES LÉXICOS", texto_errores(errores_lexicos))
-    if arbol is not None:
-        agregar_seccion(partes, "ÁRBOL SINTÁCTICO", arbol_dibujado_texto(arbol))
-    if errores_sintacticos:
-        agregar_seccion(partes, "ERRORES SINTÁCTICOS", texto_errores(errores_sintacticos))
-    if tabla is not None:
-        agregar_seccion(partes, "TABLA DE SÍMBOLOS", tabla_simbolos_texto(tabla))
-        referencias = referencias_texto(tabla)
-        if referencias:
-            agregar_seccion(partes, "REFERENCIAS POR SÍMBOLO", referencias)
-    if errores_semanticos:
-        agregar_seccion(partes, "ERRORES SEMÁNTICOS", texto_errores(errores_semanticos))
-
-    return "\n".join(partes) + "\n"
+        print(f"{ROJO}NO SE PUDO GENERAR LA IMAGEN: {exc}{RESET}")
 
 
 def escribir_archivo(nombre, contenido):
@@ -1364,23 +785,16 @@ def escribir_archivo(nombre, contenido):
 
 
 def eliminar_salidas():
-    for clave in (
-        "ARCHIVO_SIMBOLOS", "ARCHIVO_ANALISIS",
-        "ARCHIVO_REPORTE", "ARCHIVO_ARBOL",
-    ):
-        try:
-            os.remove(CONFIG[clave])
-        except OSError:
-            pass
+    for clave, ruta in CONFIG.items():
+        if clave.startswith("ARCHIVO_"):
+            try:
+                os.remove(ruta)
+            except OSError:
+                pass
 
 
-def escribir_reporte(nombre, tokens, errores_lexicos, arbol,
-                     errores_sintacticos, tabla, errores_semanticos,
-                     estado):
-    contenido = contenido_reporte(
-        nombre, tokens, errores_lexicos, arbol,
-        errores_sintacticos, tabla, errores_semanticos, estado,
-    )
+def escribir_reporte(nombre, tokens, estado, **resultados):
+    contenido = salidas.contenido_reporte(nombre, tokens, estado, **resultados)
     escribir_archivo(CONFIG["ARCHIVO_REPORTE"], contenido)
 
 
@@ -1394,9 +808,7 @@ def limpiar_ruta(texto):
 
 def cargar_archivo(ruta):
     if not ruta.lower().endswith(EXTENSION.lower()):
-        return None, (
-            f"EL ARCHIVO DEBE TENER EXTENSIÓN {EXTENSION.upper()}"
-        )
+        return None, f"EL ARCHIVO DEBE TENER EXTENSIÓN {EXTENSION.upper()}"
 
     try:
         with open(ruta, encoding="utf-8", newline="") as archivo:
@@ -1404,60 +816,46 @@ def cargar_archivo(ruta):
     except FileNotFoundError:
         return None, f"NO SE ENCONTRÓ EL ARCHIVO '{ruta}'"
     except UnicodeDecodeError:
-        return None, (
-            f"EL ARCHIVO '{ruta}' NO ESTÁ CODIFICADO EN UTF-8"
-        )
+        return None, f"EL ARCHIVO '{ruta}' NO ESTÁ CODIFICADO EN UTF-8"
     except OSError as exc:
         return None, f"NO SE PUDO LEER '{ruta}': {exc}"
 
 
 def procesar_archivo(nombre, codigo):
     eliminar_salidas()
-
-    print()
-    print(f"{CIAN}ARCHIVO:{RESET} {nombre}")
-
+    print(f"\n{CIAN}ARCHIVO:{RESET} {nombre}")
     tokens, errores_lexicos = tokenizar(codigo)
     print(
         f"{CIAN}TOKENS:{RESET} {len(tokens)}    "
         f"{CIAN}ERRORES LÉXICOS:{RESET} {len(errores_lexicos)}"
     )
     print(GRIS + "-" * 72 + RESET)
-    print(tabla_tokens_texto(tokens))
+    print(salidas.tabla_tokens_texto(tokens))
 
-    if errores_lexicos:
-        mostrar_errores("ERRORES LÉXICOS", errores_lexicos)
-        print(f"{ROJO}EL ANÁLISIS SE DETIENE POR ERRORES LÉXICOS.{RESET}")
+    arbol, errores_sintacticos = (None, []) if errores_lexicos else analizar_sintactico(tokens)
+    if errores_lexicos or errores_sintacticos:
+        fase = "LÉXICO" if errores_lexicos else "SINTÁCTICO"
+        mostrar_errores(f"ERRORES {fase}S", errores_lexicos or errores_sintacticos)
+        print(f"{ROJO}EL ANÁLISIS SE DETIENE POR ERRORES {fase}S.{RESET}")
         escribir_reporte(
-            nombre, tokens, errores_lexicos, None, [], None, [],
-            "DETENIDO EN ANÁLISIS LÉXICO",
-        )
-        return 1
-
-    arbol, errores_sintacticos = analizar_sintactico(tokens)
-
-    if errores_sintacticos:
-        mostrar_errores("ERRORES SINTÁCTICOS", errores_sintacticos)
-        print(f"{ROJO}EL ANÁLISIS SE DETIENE POR ERRORES SINTÁCTICOS.{RESET}")
-        escribir_reporte(
-            nombre, tokens, errores_lexicos, arbol,
-            errores_sintacticos, None, [],
-            "DETENIDO EN ANÁLISIS SINTÁCTICO",
+            nombre, tokens, f"DETENIDO EN ANÁLISIS {fase}", arbol=arbol,
+            errores_lexicos=errores_lexicos, errores_sintacticos=errores_sintacticos,
         )
         return 1
 
     tabla, errores_semanticos = analizar_semantico(arbol)
+    if not errores_semanticos:
+        generador = salidas.GeneradorIntermedio(tabla)
+        intermedio = generador.generar(arbol)
+        ensamblador = salidas.generar_ensamblador(intermedio, generador.etiquetas, tabla=tabla)
     escribir_imagen_arbol(nombre, arbol)
 
-    print()
-    print(f"{CIAN}ÁRBOL SINTÁCTICO{RESET}")
-    mostrar_arbol(arbol)
+    print(f"\n{CIAN}ÁRBOL SINTÁCTICO{RESET}")
+    print(salidas.arbol_dibujado_texto(arbol) or f"{GRIS}(ÁRBOL VACÍO){RESET}")
+    print(f"\n{CIAN}TABLA DE SÍMBOLOS{RESET}")
+    print(salidas.tabla_simbolos_texto(tabla) or f"{GRIS}(SIN SÍMBOLOS){RESET}")
 
-    print()
-    print(f"{CIAN}TABLA DE SÍMBOLOS{RESET}")
-    mostrar_tabla_simbolos(tabla)
-
-    escribir_archivo(CONFIG["ARCHIVO_SIMBOLOS"], contenido_simbolos(nombre, tabla))
+    escribir_archivo(CONFIG["ARCHIVO_SIMBOLOS"], salidas.contenido_simbolos(nombre, tabla))
 
     if errores_semanticos:
         mostrar_errores("ERRORES SEMÁNTICOS", errores_semanticos)
@@ -1465,21 +863,19 @@ def procesar_archivo(nombre, codigo):
             f"{ROJO}COMPILACIÓN CON {len(errores_semanticos)} "
             f"ERROR(ES) SEMÁNTICO(S).{RESET}"
         )
-        escribir_reporte(
-            nombre, tokens, errores_lexicos, arbol,
-            errores_sintacticos, tabla, errores_semanticos,
-            "DETENIDO EN ANÁLISIS SEMÁNTICO",
-        )
-        return 1
-
-    escribir_archivo(CONFIG["ARCHIVO_ANALISIS"], generar_codigo(arbol))
+        estado = "DETENIDO EN ANÁLISIS SEMÁNTICO"
+    else:
+        escribir_archivo(CONFIG["ARCHIVO_ANALISIS"], salidas.generar_codigo(arbol))
+        escribir_archivo(CONFIG["ARCHIVO_INTERMEDIO"], intermedio)
+        escribir_archivo(CONFIG["ARCHIVO_ENSAMBLADOR"], ensamblador)
+        estado = "COMPILACIÓN CORRECTA"
 
     escribir_reporte(
-        nombre, tokens, errores_lexicos, arbol,
-        errores_sintacticos, tabla, errores_semanticos,
-        "COMPILACIÓN CORRECTA",
+        nombre, tokens, estado, arbol=arbol, tabla=tabla, errores_semanticos=errores_semanticos,
     )
 
+    if errores_semanticos:
+        return 1
     print(f"{VERDE}COMPILACIÓN COMPLETADA SIN ERRORES.{RESET}")
     return 0
 

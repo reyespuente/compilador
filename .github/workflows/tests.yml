@@ -1,4 +1,4 @@
-name: Pruebas del léxico
+name: Pruebas del compilador
 
 on: [push, pull_request]
 
@@ -6,7 +6,7 @@ permissions:
   contents: read
 
 jobs:
-  lexico:
+  compilador:
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -16,4 +16,25 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - run: python -m unittest -v test_lexico
+      - run: python -m pip install -r REQUIREMENTS.TXT
+      - name: Compilar y ejecutar el ejemplo válido
+        run: |
+          python CE.py PRUEBA_CORRECTO.CE
+          test -s ARBOL_SINTACTICO.PNG
+          grep -F '[rbp - 8]' SYMBOLS.TXT
+          gcc -x assembler CODIGO_ASM.TXT -o programa
+          test "$(./programa)" = 'Articulos: 3, total: $71.5'
+      - name: Verificar los errores por fase
+        run: |
+          for fase in LEXICO SINTACTICO SEMANTICO; do
+            codigo=0
+            python CE.py "PRUEBA_${fase}.CE" || codigo=$?
+            test "$codigo" -eq 1
+            test ! -e CODIGO_ASM.TXT
+            case "$fase" in
+              LEXICO) estado=LÉXICO ;;
+              SINTACTICO) estado=SINTÁCTICO ;;
+              SEMANTICO) estado=SEMÁNTICO ;;
+            esac
+            grep -Fx "ESTADO: DETENIDO EN ANÁLISIS $estado" REPORTE_ANALISIS.TXT
+          done
